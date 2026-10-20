@@ -16,7 +16,8 @@
 
 set -u
 
-VERSION="5.1.0"
+VERSION="5.2.0"
+UPDATE_REPO="d0gban/asset_reachability"
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     echo "asset_reachability requires bash >= 4.4 (found $BASH_VERSION)." >&2
@@ -45,6 +46,8 @@ MAX_TARGETS=1048576          # hard cap (a /12); split bigger jobs
 TIMEOUT_SECS=2
 TCP_PORTS="22 80 443 8080 445 139 3389 53 25"
 OPT_NO_COLOR="false"
+OPT_NO_UPDATE_CHECK="false"
+ORIG_ARGS=()
 ASSUME_YES="false"
 RESOLVE="false"
 json_out="false"
@@ -581,6 +584,62 @@ show_list() {   # <array-name> <limit> [verbose]
 }
 
 # ---------------------------------------------------------------------------
+# Self-update (the VERSION file on GitHub is the source of truth)
+# ---------------------------------------------------------------------------
+update_base() { echo "${AR_BASE_URL:-https://raw.githubusercontent.com/$UPDATE_REPO/main}"; }
+version_gt() {   # 0 if $1 is a newer x.y.z than $2
+    local IFS=. i a b
+    local -a x y
+    read -r -a x <<< "$1"; read -r -a y <<< "$2"
+    for i in 0 1 2; do
+        a=$(( 10#${x[i]:-0} )); b=$(( 10#${y[i]:-0} ))
+        (( a > b )) && return 0
+        (( a < b )) && return 1
+    done
+    return 1
+}
+fetch_latest() {   # prints the latest version; non-zero if unreachable or garbled
+    local v url; url="$(update_base)/VERSION"
+    if   have curl; then v=$(curl -fsSL --max-time 3 "$url" 2>/dev/null)
+    elif have wget; then v=$(wget -qO- -T 3 "$url" 2>/dev/null)
+    else return 1; fi
+    v=${v//[[:space:]]/}
+    [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    echo "$v"
+}
+# Only the installed command updates itself; a git checkout should use git pull.
+is_installed_copy() { [[ $(basename "$0") == "asset-reachability" ]]; }
+self_update() {
+    local latest dir
+    is_installed_copy || die "not an installed copy (run it as 'asset-reachability'). From a git checkout use: git pull"
+    latest=$(fetch_latest) || die "can't reach GitHub to check for updates."
+    if ! version_gt "$latest" "$VERSION"; then echo "Already up to date ($VERSION)."; return 0; fi
+    have curl || die "curl is required to update."
+    echo -e "${CYAN}Updating $VERSION -> $latest ...${NC}"
+    dir=$(cd "$(dirname "$0")" && pwd)
+    # Reuses the installer, so the same syntax + SHA-256 verification applies.
+    curl -fsSL "$(update_base)/install.sh" | sh -s -- --no-deps --prefix "$dir" || die "update failed; current version left in place."
+}
+# At most once per 24h, interactive terminals only, 3s network cap.
+maybe_prompt_update() {
+    [[ -z ${AR_NO_UPDATE_CHECK:-} && $OPT_NO_UPDATE_CHECK != "true" ]] || return 0
+    [[ -t 0 && $IS_TTY == "true" ]] || return 0
+    is_installed_copy || return 0
+    local dir="${XDG_CACHE_HOME:-$HOME/.cache}/asset-reachability" stamp latest ans
+    stamp="$dir/last_check"
+    if [[ -f $stamp && -z $(find "$stamp" -mmin +1440 2>/dev/null) ]]; then return 0; fi
+    mkdir -p "$dir" 2>/dev/null && : > "$stamp" 2>/dev/null    # touch first so failures throttle too
+    latest=$(fetch_latest) || return 0
+    version_gt "$latest" "$VERSION" || return 0
+    echo -ne "${YELLOW}Update available: $VERSION -> $latest. Update now? [Y/n] ${NC}"
+    read -r ans </dev/tty 2>/dev/null || ans="n"
+    if [[ -z $ans || $ans =~ ^[Yy] ]]; then
+        if self_update; then echo; AR_NO_UPDATE_CHECK=1 exec "$0" "${ORIG_ARGS[@]}"; fi
+    fi
+    echo
+}
+
+# ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
 perform_reachability_test() {
@@ -745,6 +804,9 @@ Output / UX:
   -v, --verbose               List every active host.
   -y, --yes                   Skip the large-scan confirmation.
       --no-color              Disable ANSI colors (also honours NO_COLOR).
+      --update                Update to the latest release (installed copy only).
+      --check-update          Report whether a newer release exists.
+      --no-update-check       Skip the daily update prompt (or set AR_NO_UPDATE_CHECK=1).
   -V, --version               Print version.
   -h, --help                  This message.
 
@@ -788,7 +850,8 @@ require_arg() { [[ -n ${2:-} && ${2:0:1} != "-" ]] || { echo "Error: missing arg
 
 main() {
     local verbose="false" split_files="false" threads=10 output_dir="scans" scan_method="ping"
-    local input_type="" input_value=""
+    local input_type="" input_value="" latest
+    ORIG_ARGS=("$@")
 
     trap on_interrupt INT TERM
     trap '[[ -n $TEMP_DIR && -d $TEMP_DIR ]] && rm -rf "$TEMP_DIR"' EXIT
@@ -827,6 +890,13 @@ main() {
             -v|--verbose)     verbose="true"; shift ;;
             -y|--yes)         ASSUME_YES="true"; shift ;;
             --no-color)       OPT_NO_COLOR="true"; shift ;;
+            --no-update-check) OPT_NO_UPDATE_CHECK="true"; shift ;;
+            --update)         setup_colors; self_update; exit $? ;;
+            --check-update)
+                latest=$(fetch_latest) || { echo "Can't reach GitHub." >&2; exit 1; }
+                if version_gt "$latest" "$VERSION"; then echo "Update available: $VERSION -> $latest (run: asset-reachability --update)"
+                else echo "Up to date ($VERSION)."; fi
+                exit 0 ;;
             -V|--version)     echo "asset_reachability $VERSION"; exit 0 ;;
             -h|--help)        setup_colors; display_help 0 ;;
             *) echo "Invalid option: $1" >&2; setup_colors; display_help 1 ;;
@@ -836,6 +906,7 @@ main() {
     setup_colors
     [[ -n $input_type && -n $input_value ]] || { echo -e "${RED}Error: missing input (-f/-l/-c/-r).${NC}" >&2; display_help 1; }
 
+    maybe_prompt_update
     detect_ping
     detect_arping
     perform_reachability_test "$input_value" "$input_type" "$verbose" "$threads" "$split_files" "$output_dir" "$scan_method"

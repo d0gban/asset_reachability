@@ -49,7 +49,7 @@ exit 0
 EOF
 chmod +x "$STUBS/ping" "$STUBS/nmap"
 
-run() { PATH="$STUBS:$PATH" NO_COLOR=1 bash "$SCRIPT" "$@" 2>&1; }
+run() { PATH="$STUBS:$PATH" NO_COLOR=1 AR_NO_UPDATE_CHECK=1 bash "$SCRIPT" "$@" 2>&1; }
 
 # shellcheck disable=SC1090
 source "$SCRIPT"
@@ -111,6 +111,16 @@ has "nmap arp-response known" "$(confidence arp-response)" "confirmed (L2)"
 has "reset hint"              "$(confidence reset:80)"      "RST"
 has "no-route is ambiguous"   "$(confidence no-route)"      "firewall REJECT"
 eq  "json escaping" "$(json_str 'a"b\c')" 'a\"b\\c'
+
+echo "== versioning / update =="
+version_gt 5.2.0 5.1.9  && ok "5.2.0 > 5.1.9"   || bad "5.2.0 > 5.1.9"
+version_gt 5.10.0 5.9.0 && ok "5.10.0 > 5.9.0 (numeric, not lexical)" || bad "numeric compare"
+version_gt 5.1.0 5.1.0  && bad "equal is not newer" || ok "equal is not newer"
+version_gt 5.0.9 5.1.0  && bad "older is not newer" || ok "older is not newer"
+eq "VERSION file matches script" "$(tr -d '[:space:]' < "$HERE/../VERSION")" "$VERSION"
+fetch_latest_stub() { echo "$1"; }
+has "--check-update unreachable fails cleanly" "$(AR_BASE_URL=file:///nonexistent run --check-update)" "reach GitHub"
+has "--update refuses non-installed copy" "$(run --update)" "not an installed copy"
 
 echo "== end-to-end (stubbed ping/nmap) =="
 OUT="$WORK/out"

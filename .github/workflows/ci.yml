@@ -18,6 +18,8 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y shellcheck
           shellcheck -s bash -S warning asset_reachability.sh tests/run.sh || true
           shellcheck -s sh -S warning install.sh
+      - name: VERSION file matches script
+        run: test "$(cat VERSION)" = "$(sed -n 's/^VERSION="\(.*\)"/\1/p' asset_reachability.sh)"
       - name: Checksum is current
         run: sha256sum -c SHA256SUMS
       - name: Tests

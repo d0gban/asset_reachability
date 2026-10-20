@@ -21,7 +21,7 @@ Options (pass after `sh -s --`):
 ```sh
 curl -fsSL https://raw.githubusercontent.com/d0gban/asset_reachability/main/install.sh | sh -s -- --no-deps
 curl -fsSL .../install.sh | sh -s -- --prefix "$HOME/.local/bin"
-curl -fsSL .../install.sh | sh -s -- --ref v5.1.0          # pin a tag
+curl -fsSL .../install.sh | sh -s -- --ref v5.2.0          # pin a tag
 curl -fsSL .../install.sh | sh -s -- --uninstall
 ```
 
@@ -95,6 +95,26 @@ A text report, plus optional `-s` (three plain IP lists) and `-j` (JSON with per
 Raw-packet methods (`arp`, `syn`, `ack`, `icmp-*`) need root; without it nmap degrades to TCP-connect probes and the reported reasons show what actually answered.
 
 macOS: the script uses `ping -t` there (BSD `-W` is milliseconds) and `gtimeout` from Homebrew coreutils.
+
+## Updates
+
+The installed command checks GitHub for a newer `VERSION` at most once every 24 hours, only in an interactive terminal, and asks:
+
+```
+Update available: 5.1.0 -> 5.2.0. Update now? [Y/n]
+```
+
+Answering yes re-runs the installer in place (same syntax and SHA-256 verification), then restarts your command with the same arguments. Scripted/piped runs are never interrupted.
+
+```sh
+asset-reachability --check-update    # report only
+asset-reachability --update          # update now
+asset-reachability --no-update-check # skip the prompt for this run (or AR_NO_UPDATE_CHECK=1 always)
+```
+
+The check is one small HTTPS request to `raw.githubusercontent.com` with a 3-second cap; offline hosts are unaffected. A copy run from a git checkout never self-updates (use `git pull`).
+
+**Publishing a release:** bump `VERSION` in `asset_reachability.sh` and the `VERSION` file, run `sha256sum asset_reachability.sh > SHA256SUMS`, commit, push to `main` (optionally `git tag vX.Y.Z`). CI fails if the two version numbers or the checksum disagree.
 
 ## Development
 
