@@ -1,0 +1,115 @@
+# asset-reachability
+
+IPv4 host reachability sweeps from a single bash script. Every host gets a three-state verdict (**up / down / filtered**) together with the *evidence* behind it, so you can tell a confirmed ARP reply from a lone SYN-ACK that might be a firewall.
+
+> **Only scan networks you own or are explicitly authorized to test.**
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/d0gban/asset_reachability/main/install.sh | sh
+```
+
+The installer:
+
+- installs the `asset-reachability` command to `/usr/local/bin` (root/sudo) or `~/.local/bin` (otherwise);
+- installs missing tools that unlock the accurate probe methods — `nmap`, `arping`, `dig`, `nc` (apt, dnf/yum, apk, pacman, zypper, brew);
+- verifies the download (bash syntax check + SHA-256 against `SHA256SUMS`) before installing.
+
+Options (pass after `sh -s --`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/d0gban/asset_reachability/main/install.sh | sh -s -- --no-deps
+curl -fsSL .../install.sh | sh -s -- --prefix "$HOME/.local/bin"
+curl -fsSL .../install.sh | sh -s -- --ref v5.1.0          # pin a tag
+curl -fsSL .../install.sh | sh -s -- --uninstall
+```
+
+For a hard integrity guarantee, pin the checksum yourself: `AR_SHA256=<sha256 of asset_reachability.sh> sh install.sh`.
+
+**Requirements:** Linux or macOS (Windows: use WSL), bash ≥ 4.4 (macOS: `brew install bash coreutils`), `ping`, `awk`, `xargs`. Everything else is optional.
+
+## Usage
+
+```sh
+asset-reachability -c 192.168.1.0/24                      # ICMP sweep of a /24
+asset-reachability -c 192.168.1.0/24 -m arp -i eth0 -s   # ARP (root), split result files
+asset-reachability -r 10.0.0.1-10.0.0.254 -m all -j      # every probe, plus JSON
+asset-reachability -f hosts.txt -m tcp -v --resolve       # from a file, with reverse DNS
+asset-reachability -c 10.0.0.0/24 -m ack                  # nmap engine auto-selected
+```
+
+| Input | Meaning |
+|---|---|
+| `-f FILE` | one IP per line; `#` comments; invalid lines are reported and skipped |
+| `-l "a,b,c"` | comma-separated IPs |
+| `-c CIDR` | CIDR block (network/broadcast excluded, except /31 and /32) |
+| `-r A-B` | inclusive range |
+
+| Option | Meaning |
+|---|---|
+| `-m METHOD` | `ping` (default) `icmp` `arp` `tcp` `udp` `all` — plus nmap-only `syn` `ack` `icmp-ts` `icmp-mask` |
+| `-e ENGINE` | `auto` (default), `bash`, `nmap` |
+| `-t N` / `-w SEC` | parallel workers (default 10) / per-probe timeout (default 2) |
+| `-i IFACE` | interface for arp / nmap raw probes |
+| `-o DIR` | output directory (default `scans/`) |
+| `-s` `-j` | split up/filtered/down files · JSON output |
+| `--resolve` `-v` `-y` `--no-color` | reverse DNS · list every host · skip the large-scan prompt · no ANSI |
+
+Hard limit: 1,048,576 targets per run (a /12). Scans over 4,096 targets ask for confirmation unless `-y`.
+
+## How verdicts are decided
+
+| Verdict | Meaning |
+|---|---|
+| **UP** | A probe got a positive reply: `arp-reply`, `echo-reply`, `syn-ack`, `reset` (RST), or an application reply (`dns-response`, `snmp-response`, `nbt-response`). |
+| **DOWN** | The *path* said the host isn't there: ICMP host-unreachable, or no ARP reply from a target proven to be on the local subnet. |
+| **FILTERED** | Silence or an ambiguous error. A live host that drops probes lands here — re-check with `nmap -Pn`. |
+
+Deliberate accuracy choices:
+
+- **Silence is never "down"** (except on-subnet ARP). A firewalled host and a dead host look the same from outside.
+- **TCP "no route to host" is `filtered`, not `down`.** Linux returns that error for firewall `REJECT` rules (e.g. firewalld's default) as well as for ARP failure.
+- **ARP silence is only `down` when the target is directly attached** (`ip route get` shows no gateway). Otherwise it's `filtered`.
+- **UDP requires a real application reply.** `nc -u -z` reports success on silence, so it isn't used.
+- **A failing nmap aborts the run** instead of reporting every host as down.
+- When positive and negative evidence conflict (method `all`), a positive reply wins.
+
+Each result line carries its reason and a confidence hint, e.g. `10.0.0.5  [arp-reply — confirmed (L2)]`.
+
+## Output
+
+A text report, plus optional `-s` (three plain IP lists) and `-j` (JSON with per-host `reason`/`confidence`) in `scans/`. Colours turn off when piped, with `NO_COLOR`, or `--no-color`. Exit status: `0` completed, `1` error, `130` interrupted.
+
+## Methods and dependencies
+
+| Method | Bash engine needs | nmap engine |
+|---|---|---|
+| ping / icmp | `ping` | `-PE` |
+| arp | `arping` + root (falls back to ping) | `-PR` |
+| tcp | `timeout` (or `nc`); 9 ports probed concurrently | `-PS` |
+| udp | `dig` / `snmpget` / `nmblookup` (nmap strongly preferred) | `-PU` |
+| syn, ack, icmp-ts, icmp-mask | — (nmap only) | `-PS` `-PA` `-PP` `-PM` |
+| all | all of the above | all probes |
+
+Raw-packet methods (`arp`, `syn`, `ack`, `icmp-*`) need root; without it nmap degrades to TCP-connect probes and the reported reasons show what actually answered.
+
+macOS: the script uses `ping -t` there (BSD `-W` is milliseconds) and `gtimeout` from Homebrew coreutils.
+
+## Development
+
+```sh
+bash tests/run.sh          # offline suite; ping/nmap are stubbed, no root or network needed
+```
+
+After editing `asset_reachability.sh`, refresh the checksum the installer verifies:
+
+```sh
+sha256sum asset_reachability.sh > SHA256SUMS
+```
+
+CI checks LF line endings, syntax, ShellCheck, the checksum, and the tests (Linux and macOS).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

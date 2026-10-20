@@ -1,0 +1,31 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No CRLF line endings
+        run: |
+          if grep -rIlP --include='*.sh' --include=SHA256SUMS '\r' .; then echo "CRLF found"; exit 1; fi
+      - name: Syntax
+        run: bash -n asset_reachability.sh && sh -n install.sh && bash -n tests/run.sh
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck -s bash -S warning asset_reachability.sh tests/run.sh || true
+          shellcheck -s sh -S warning install.sh
+      - name: Checksum is current
+        run: sha256sum -c SHA256SUMS
+      - name: Tests
+        run: bash tests/run.sh
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install bash coreutils
+      - run: /opt/homebrew/bin/bash tests/run.sh
