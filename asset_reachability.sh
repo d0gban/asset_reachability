@@ -16,7 +16,7 @@
 
 set -u
 
-VERSION="5.3.0"
+VERSION="5.4.0"
 UPDATE_REPO="d0gban/asset_reachability"
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
@@ -37,6 +37,8 @@ fi
 progress_bar_width=34
 PING_TIMEOUT_FLAG="-W"
 ARPING_IFACE_FLAG="-I"
+ARPING_FLAVOR="iputils"
+ARP_TRIES=4                  # ARP requests per host before concluding silence
 INTERFACE=""
 TEMP_DIR=""
 XARGS_PID=""
@@ -209,10 +211,10 @@ detect_ping() {
     have ping || { PING_TIMEOUT_FLAG=""; return 0; }
     ping -c 1 "$PING_TIMEOUT_FLAG" 1 127.0.0.1 >/dev/null 2>&1 || PING_TIMEOUT_FLAG=""
 }
-detect_arping() {   # iputils uses -I <iface>; Thomas Habets' arping uses -i
-    ARPING_IFACE_FLAG="-I"
+detect_arping() {   # iputils: -I <iface>, -f; Thomas Habets: -i <iface>, -C 1
+    ARPING_IFACE_FLAG="-I"; ARPING_FLAVOR="iputils"
     have arping || return 0
-    if arping -h 2>&1 | grep -qi 'thomas habets'; then ARPING_IFACE_FLAG="-i"; fi
+    if arping -h 2>&1 | grep -qi 'thomas habets'; then ARPING_IFACE_FLAG="-i"; ARPING_FLAVOR="habets"; fi
 }
 
 # Decide which engine runs for <method>; error out on impossible combinations.
@@ -233,36 +235,165 @@ resolve_engine() {
     fi
 }
 
-# Confirm the chosen method can actually run; warn clearly otherwise.
+# ---------------------------------------------------------------------------
+# Pre-flight: before a single probe is sent, confirm the chosen method can
+# actually produce a VALID answer on this host.
+#   ✓ capable   → proceeds
+#   ! degraded  → WARN, says what it falls back to (cancels under --strict)
+#   ✗ incapable → CANCEL (exit 2): continuing would yield meaningless results
+# A probe that can't run must never look like "host is down".
+# ---------------------------------------------------------------------------
+CAP_OK=(); CAP_WARN=(); CAP_FAIL=()
+STRICT="false"
+CHECK_ONLY="false"
+ARPING_USABLE=1
+IFACE_BAD=0
+cap_ok()   { CAP_OK+=("$*"); }
+cap_warn() { CAP_WARN+=("$*"); }
+cap_fail() { CAP_FAIL+=("$*"); }
+
+# Raw-socket rights: root, or CAP_NET_RAW (bit 13 of CapEff).
+can_raw() {
+    is_root && return 0
+    local eff; eff=$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null)
+    [[ -n $eff && $eff =~ ^[0-9a-fA-F]+$ ]] && (( (16#$eff >> 13) & 1 )) && return 0
+    return 1
+}
+check_iface() {
+    [[ -n $INTERFACE ]] || return 0
+    if have ip; then
+        if ! ip link show dev "$INTERFACE" >/dev/null 2>&1; then IFACE_BAD=1; cap_fail "interface '$INTERFACE' does not exist (see: ip -br link)"; return; fi
+        local st; st=$(ip -br link show dev "$INTERFACE" 2>/dev/null | awk '{print $2}')
+        if [[ $st == UP || $st == UNKNOWN ]]; then cap_ok "interface $INTERFACE is $st"
+        else cap_warn "interface '$INTERFACE' is $st — probes may not leave it"; fi
+    elif [[ -d /sys/class/net && ! -e /sys/class/net/$INTERFACE ]]; then
+        IFACE_BAD=1; cap_fail "interface '$INTERFACE' does not exist"
+    fi
+}
+# Run arping once against the gateway and look for a privilege error. A mere
+# timeout is fine (the gateway may be silent); "permission/root" is not.
+arping_selftest() {
+    local target out args ia=()
+    target=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}'); target=${target:-127.0.0.1}
+    [[ -n $INTERFACE ]] && ia=("${ARPING_IFACE_FLAG:--I}" "$INTERFACE")
+    if [[ ${ARPING_FLAVOR:-iputils} == habets ]]; then args=(-c 1); else args=(-c 1 -w 1); fi
+    out=$(run_to 3 arping "${args[@]}" "${ia[@]}" "$target" 2>&1)
+    ! grep -qiE 'permission|not permitted|must be root|libnet_init|you need to be root|cap_net_raw' <<<"$out"
+}
+# ARP only reaches directly-attached subnets: sample first/middle/last target.
+check_targets_onlink() {
+    local n=${#TARGETS[@]} s r=0 l=0 rc
+    (( n )) && have ip || return 0
+    for s in "${TARGETS[0]}" "${TARGETS[n/2]}" "${TARGETS[n-1]}"; do
+        on_link "$s"; rc=$?
+        (( rc == 1 )) && r=$(( r+1 ))
+        (( rc == 0 )) && l=$(( l+1 ))
+    done
+    if   (( r > 0 && l == 0 )); then cap_warn "targets look ROUTED (via a gateway), but ARP only reaches directly-attached subnets — most hosts will read 'filtered'. Use ping/tcp/all, or scan from that subnet."
+    elif (( r > 0 ));           then cap_warn "some targets are routed (via a gateway); ARP can only answer for the directly-attached ones."
+    elif (( l > 0 ));           then cap_ok "targets are on a directly-attached subnet"; fi
+}
+
 preflight() {
-    local method=$1 eng=$EFFECTIVE_ENGINE
+    local method=$1 eng=$EFFECTIVE_ENGINE t raw=0 ip_ok=0 tools=""
+    CAP_OK=(); CAP_WARN=(); CAP_FAIL=(); ARPING_USABLE=1; IFACE_BAD=0
+    can_raw && raw=1
+    have ip && ip_ok=1
+
+    for t in awk sort comm xargs mktemp date id; do
+        have "$t" || cap_fail "required utility '$t' not found"
+    done
+
     if [[ $eng == "nmap" ]]; then
-        if [[ $method == arp || $method == syn || $method == ack || $method == icmp-ts || $method == icmp-mask || $method == all ]] && ! is_root; then
-            echo -e "${YELLOW}Note: '$method' sends raw packets and needs root; without it nmap falls back to TCP connect probes (results are labelled with what actually answered).${NC}"
+        if have nmap; then
+            if nmap -sn -n 127.0.0.1 2>/dev/null | grep -q 'Host is up'; then cap_ok "nmap $(nmap --version 2>/dev/null | awk 'NR==1{print $3}') works"
+            else cap_fail "nmap is installed but failed a self-test (nmap -sn 127.0.0.1)"; fi
+        else cap_fail "nmap not found"; fi
+        case $method in
+            arp|ack|icmp-ts|icmp-mask|udp)
+                if (( raw )); then cap_ok "raw sockets permitted (needed for '$method')"
+                else cap_fail "'$method' needs raw sockets; without root nmap silently substitutes other probes. Re-run with sudo (or: setcap cap_net_raw+ep \$(command -v nmap))."; fi ;;
+            syn|tcp|ping|icmp|all)
+                if (( raw )); then cap_ok "raw sockets permitted"
+                else cap_warn "not root: nmap will use TCP-connect probes instead of raw '$method' probes (each result's reason shows what actually answered)"; fi ;;
+        esac
+        [[ $method == arp || $method == all ]] && check_iface
+        [[ $method == arp ]] && check_targets_onlink
+        if [[ $method == arp ]] && ! { have arping && (( raw )); }; then
+            ARPING_USABLE=0
+            cap_warn "no usable arping: nmap's non-responders will be re-checked with ping only (no ARP retries)"
         fi
-        return 0
+    else
+        case $method in
+            ping|icmp)
+                if have ping; then cap_ok "ping available"; else cap_fail "ping not found"; fi ;;
+            arp)
+                check_iface
+                if (( IFACE_BAD )); then ARPING_USABLE=0   # interface already failed: say nothing misleading about arping
+                elif ! have arping; then
+                    ARPING_USABLE=0
+                    if have ping; then cap_warn "arping not found — 'arp' will FALL BACK to ICMP ping (not true L2 discovery). Install: iputils-arping / arping."
+                    else cap_fail "neither arping nor ping is available — nothing can probe"; fi
+                elif ! can_raw; then
+                    ARPING_USABLE=0
+                    if have ping; then cap_warn "arping needs raw-socket rights and you are not root — 'arp' will FALL BACK to ICMP ping. Re-run with sudo for true ARP."
+                    else cap_fail "arping needs root and ping is unavailable — re-run with sudo"; fi
+                elif ! arping_selftest; then
+                    ARPING_USABLE=0
+                    if have ping; then cap_warn "arping failed its self-test (privilege error) — 'arp' will FALL BACK to ICMP ping."
+                    else cap_fail "arping failed its self-test (privilege error) and ping is unavailable"; fi
+                else
+                    cap_ok "arping ($ARPING_FLAVOR) usable, raw sockets permitted"
+                    if have ping; then cap_ok "ping available for escalation when ARP is lost"
+                    else cap_warn "ping not found — lost ARP replies can't be double-checked"; fi
+                fi
+                check_targets_onlink ;;
+            tcp)
+                if ! have timeout && ! have nc; then cap_fail "tcp needs 'timeout' (coreutils) or 'nc'"
+                elif have timeout && bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>&1 | grep -q 'No such file'; then
+                    if have nc; then cap_warn "bash lacks /dev/tcp — using nc (can't tell refused from silent)"
+                    else cap_fail "bash was built without /dev/tcp and nc is missing"; fi
+                else cap_ok "tcp probing available"; fi ;;
+            udp)
+                have dig       && tools+=" dig(dns)"
+                have snmpget   && tools+=" snmpget(snmp)"
+                have nmblookup && tools+=" nmblookup(netbios)"
+                if [[ -n $tools ]]; then cap_ok "UDP probes:${tools}"
+                else cap_fail "no UDP tooling (dig / snmpget / nmblookup) and nmap isn't installed — every host would read 'filtered'. Install one, or nmap."; fi ;;
+            all)
+                if have ping; then cap_ok "ping available"; else cap_fail "ping not found"; fi
+                if have arping && can_raw && arping_selftest; then cap_ok "arping usable"
+                else ARPING_USABLE=0; cap_warn "ARP layer skipped (arping missing / not root)"; fi
+                if have timeout || have nc; then cap_ok "tcp probing available"; else cap_warn "TCP layer skipped (no timeout/nc)"; fi
+                if have dig || have snmpget || have nmblookup; then cap_ok "UDP probing available"; else cap_warn "UDP layer skipped (no dig/snmpget/nmblookup)"; fi
+                check_iface ;;
+        esac
     fi
-    case $method in
-        ping|icmp|all) have ping || die "ping not found." ;;
-    esac
-    case $method in
-        arp)
-            have arping || echo -e "${YELLOW}Note: arping not found — 'arp' falls back to ICMP ping.${NC}"
-            is_root || echo -e "${YELLOW}Note: arping usually needs root.${NC}"
-            have ip || echo -e "${YELLOW}Note: 'ip' (iproute2) not found — can't prove targets are on-subnet, so ARP silence is reported as 'filtered', not 'down'.${NC}" ;;
-        tcp|all)
-            if ! have timeout && ! have nc; then
-                [[ $method == tcp ]] && die "tcp needs 'timeout' (coreutils) or 'nc'."
-                echo -e "${YELLOW}Note: no 'timeout' or 'nc' — TCP probes in 'all' are skipped.${NC}"
-            fi
-            if have timeout && bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>&1 | grep -q 'No such file'; then
-                have nc || die "this bash was built without /dev/tcp support and 'nc' is missing; tcp probes can't run."
-            fi ;;
-    esac
-    if [[ $method == udp ]]; then
-        have dig || have snmpget || have nmblookup || \
-            echo -e "${YELLOW}Note: bash UDP needs dig/snmpget/nmblookup for a real reply; without them every host reads 'filtered'. Install nmap for UDP.${NC}"
+
+    # The accuracy guards (MAC corroboration, on-subnet proof) need iproute2.
+    if (( ip_ok )); then cap_ok "iproute2 present — L2 false-positive guards active"
+    else cap_warn "'ip' (iproute2) missing — L2 false-positive guards and on-subnet 'down' proofs are DISABLED; treat 'up' on a shared network with caution"; fi
+
+    export ARPING_USABLE
+    report_capabilities "$method" "$eng"
+}
+
+report_capabilities() {
+    local method=$1 eng=$2 m
+    echo -e "${BOLD}Pre-flight${NC} ${DIM}(method: $method, engine: $eng)${NC}"
+    for m in "${CAP_OK[@]}";   do echo -e "  ${GREEN}✓${NC} $m"; done
+    for m in "${CAP_WARN[@]}"; do echo -e "  ${YELLOW}!${NC} ${YELLOW}$m${NC}"; done
+    for m in "${CAP_FAIL[@]}"; do echo -e "  ${RED}✗ $m${NC}"; done
+    if (( ${#CAP_FAIL[@]} )); then
+        echo -e "${RED}Cancelled: '$method' cannot produce valid results on this host (fix the ✗ above).${NC}" >&2
+        exit 2
     fi
+    if (( ${#CAP_WARN[@]} )) && [[ $STRICT == "true" ]]; then
+        echo -e "${RED}Cancelled: warnings present and --strict is set.${NC}" >&2
+        exit 2
+    fi
+    (( ${#CAP_WARN[@]} )) && echo -e "  ${DIM}Continuing with the degraded mode(s) above.${NC}"
+    echo ""
 }
 
 # ---------------------------------------------------------------------------
@@ -292,23 +423,52 @@ l2_unanswered() {
     on_link "$1" || return 1
     ip -4 neigh show "$1" 2>/dev/null | grep -qE 'INCOMPLETE|FAILED'
 }
-probe_ping() {      # REASON: echo-reply | host-unreach | no-response
-    local ip=$1 to=$2 out rc
+probe_ping() {      # <ip> <timeout> [count]  REASON: echo-reply | host-unreach | no-response
+    local ip=$1 to=$2 count=${3:-1} out rc
     if [[ -n $PING_TIMEOUT_FLAG ]]; then
-        out=$(ping -c 1 "$PING_TIMEOUT_FLAG" "$to" "$ip" 2>&1); rc=$?
+        out=$(ping -c "$count" "$PING_TIMEOUT_FLAG" "$to" "$ip" 2>&1); rc=$?
     else
-        out=$(ping -c 1 "$ip" 2>&1); rc=$?
+        out=$(ping -c "$count" "$ip" 2>&1); rc=$?
     fi
     if   (( rc==0 )); then REASON="echo-reply"; return 0       # exit 0 == reply received
     elif grep -qiE 'unreachable' <<<"$out"; then REASON="host-unreach"; return 1
     else REASON="no-response"; return 1; fi
 }
-probe_arp() {       # REASON: arp-reply | no-arp-reply | arping-absent ; rc 2 = arping absent
-    local ip=$1 to=$2 ia=()
-    have arping || { REASON="arping-absent"; return 2; }
+# ARP can be lossy (Wi-Fi/power-save devices were seen answering 1 request in 10),
+# so a request is retried; the probe stops at the first reply.
+probe_arp() {       # <ip> <timeout> [tries]   REASON: arp-reply | no-arp-reply | arping-absent ; rc 2 = arping absent
+    local ip=$1 to=$2 tries=${3:-${ARP_TRIES:-4}} ia=() args
+    have arping && [[ ${ARPING_USABLE:-1} == 1 ]] || { REASON="arping-absent"; return 2; }
     [[ -n $INTERFACE ]] && ia=("${ARPING_IFACE_FLAG:--I}" "$INTERFACE")
-    if run_to "$to" arping -c 1 "${ia[@]}" "$ip" >/dev/null 2>&1; then REASON="arp-reply"; return 0; fi
+    if [[ ${ARPING_FLAVOR:-iputils} == habets ]]; then args=(-c "$tries" -C 1); else args=(-c "$tries" -f -w "$tries"); fi
+    if run_to $(( tries + to )) arping "${args[@]}" "${ia[@]}" "$ip" >/dev/null 2>&1; then REASON="arp-reply"; return 0; fi
     REASON="no-arp-reply"; return 1
+}
+# True when the kernel holds a FRESH (REACHABLE) MAC for this on-link target that
+# is not the gateway's — i.e. the host answered the kernel's own ARP just now.
+l2_fresh() {
+    local ip=$1 line
+    have ip || return 1
+    on_link "$ip" || return 1
+    line=$(ip -4 neigh show "$ip" 2>/dev/null | head -n 1)
+    [[ $line == *lladdr* && $line == *REACHABLE* ]] || return 1
+    l2_verify "$ip"
+}
+# Last-ditch evidence that an on-link host exists once ARP went quiet. Lossy
+# (Wi-Fi / power-save) hosts ignore ARP and even ICMP for seconds at a time, but
+# a TCP connect keeps re-ARPing through its SYN retransmits and often gets through.
+#   rc 0 = alive (REASON says how)   rc 1 = no sign of life (ESC_UNREACH=1 if ICMP host-unreachable seen)
+liveness_escalate() {   # <ip> <timeout>
+    local ip=$1 to=$2
+    ESC_UNREACH=0
+    if probe_ping "$ip" "$to" 3; then REASON="echo-reply(arp-missed)"; return 0   # 3 pings: sleeping radios need sustained traffic to wake
+    elif [[ $REASON == host-unreach ]]; then ESC_UNREACH=1; fi
+    if l2_fresh "$ip"; then REASON="arp-reply(kernel)"; return 0; fi
+    if have timeout || have nc; then
+        if probe_tcp "$ip" "$to"; then REASON="${REASON}:${REPLY_PORT}"; return 0; fi
+    fi
+    REASON="no-response"
+    return 1
 }
 # One TCP connect.  rc: 0 open | 10 refused (RST) | 11 ICMP unreachable | 1 silent
 tcp_connect() {
@@ -425,8 +585,13 @@ check_host() {
                 if probe_ping "$ip" "$to"; then verdict="up"; reason="echo-reply(arp-fallback)"
                 elif [[ $REASON == host-unreach ]]; then verdict="down"; reason="$REASON"
                 else verdict="filtered"; reason="$REASON"; fi
-            elif on_link "$ip"; then verdict="down"; reason="no-arp-reply"        # on-subnet silence = trustworthy down
-            else verdict="filtered"; reason="no-arp-reply-unverified"; fi ;;       # can't prove on-subnet
+            else
+                # ARP stayed silent. Escalate before concluding anything.
+                if liveness_escalate "$ip" "$to"; then verdict="up"; reason="$REASON"
+                elif (( ESC_UNREACH ));           then verdict="down"; reason="host-unreach"
+                elif l2_unanswered "$ip";         then verdict="down"; reason="no-arp-reply"    # arping, ICMP, TCP AND kernel ARP all failed
+                else verdict="filtered"; reason="no-arp-reply-unverified"; fi
+            fi ;;
         tcp)
             if probe_tcp "$ip" "$to"; then verdict="up"; reason="$REASON:$REPLY_PORT"
             else verdict="filtered"; reason="$REASON"; fi ;;
@@ -438,7 +603,7 @@ check_host() {
             #   a positive reply (anything answered)  >  an explicit path "down"
             #   >  ambiguous (RST-less silence / ICMP errors on connect).
             local pos="" neg="" weak=""
-            if probe_arp "$ip" 1; then pos="arp-reply"; fi
+            if probe_arp "$ip" 1 1; then pos="arp-reply"; fi
             if [[ -z $pos ]]; then
                 if probe_ping "$ip" "$to"; then pos="echo-reply"
                 elif [[ $REASON == host-unreach ]]; then neg="host-unreach"; fi
@@ -468,7 +633,7 @@ check_host() {
     fi
     printf '%s\t%s\t%s\n' "$ip" "$verdict" "$reason"
 }
-export -f have run_to on_link l2_verify l2_unanswered probe_ping probe_arp tcp_connect tcp_ports_run probe_tcp udp_svc udp_port_of probe_udp check_host die
+export -f have run_to on_link l2_verify l2_unanswered l2_fresh liveness_escalate probe_ping probe_arp tcp_connect tcp_ports_run probe_tcp udp_svc udp_port_of probe_udp check_host die
 
 # ---------------------------------------------------------------------------
 # Progress bar with rate + ETA (TTY only)
@@ -609,11 +774,15 @@ scan_engine_nmap() {
         "$reasons" "$TEMP_DIR/up.txt" > "$resultfile"
     local ip
     if [[ $method == arp ]]; then
-        # Silence on a directly-attached subnet is a trustworthy down; otherwise it is only filtered.
-        while IFS= read -r ip; do
-            if on_link "$ip"; then printf '%s\tdown\tno-arp-reply\n' "$ip"
-            else printf '%s\tfiltered\tno-arp-reply-unverified\n' "$ip"; fi
-        done < "$TEMP_DIR/notup.txt" >> "$resultfile"
+        # nmap sends few ARP requests and a lossy host can miss them all, so its
+        # silence is only a lead: re-check every non-responder with the retrying,
+        # escalating bash 'arp' probe before anything is called down.
+        if [[ -s $TEMP_DIR/notup.txt ]]; then
+            echo -e "${CYAN}Re-checking $(wc -l < "$TEMP_DIR/notup.txt" | tr -d ' ') non-responders (ARP retries + ping escalation)...${NC}"
+            export METHOD=arp TIMEOUT=$TIMEOUT_SECS PING_TIMEOUT_FLAG ARPING_IFACE_FLAG ARPING_FLAVOR ARPING_USABLE ARP_TRIES INTERFACE
+            xargs -P "${THREADS:-20}" -n 1 bash -c 'check_host "$1" "$METHOD" "$TIMEOUT"' _ \
+                < "$TEMP_DIR/notup.txt" >> "$resultfile"
+        fi
     else
         awk -v OFS='\t' '{print $1,"filtered","no-response"}' "$TEMP_DIR/notup.txt" >> "$resultfile"
     fi
@@ -621,7 +790,7 @@ scan_engine_nmap() {
     # arp-response is already L2 evidence.
     local tmpres="$TEMP_DIR/results.l2" v r vrc
     while IFS=$'\t' read -r ip v r; do
-        if [[ $v == up && $r != arp-response* ]]; then
+        if [[ $v == up && $r != arp-response* && $r != arp-reply* ]]; then
             l2_verify "$ip"; vrc=$?
             case $vrc in
                 1) v="filtered"; r="unverified-no-l2:$r" ;;
@@ -641,7 +810,7 @@ scan_engine_nmap() {
 # ---------------------------------------------------------------------------
 scan_engine_bash() {
     local method=$1 ipfile=$2 resultfile=$3 threads=$4 d a
-    export METHOD=$method TIMEOUT=$TIMEOUT_SECS PING_TIMEOUT_FLAG ARPING_IFACE_FLAG INTERFACE TCP_PORTS CANARY_RST UDP_POISONED
+    export METHOD=$method TIMEOUT=$TIMEOUT_SECS PING_TIMEOUT_FLAG ARPING_IFACE_FLAG ARPING_FLAVOR ARPING_USABLE ARP_TRIES INTERFACE TCP_PORTS CANARY_RST UDP_POISONED
     : > "$resultfile"
     xargs -P "$threads" -n 1 bash -c 'check_host "$1" "$METHOD" "$TIMEOUT"' _ \
         < "$ipfile" > "$resultfile" &
@@ -667,6 +836,23 @@ scan_engine_bash() {
         update_progress "$total_ips" "$total_ips" "$a" "$(( d-a ))"
         echo -e "\n"
     fi
+}
+
+# A "down" that rests on silence alone (reason no-arp-reply) is re-verified once
+# after a pause: lossy hosts go quiet in bursts, so a second, time-separated round
+# of ARP + ping + TCP must ALSO find nothing before the verdict stands.
+RECHECK_DELAY=5
+recheck_downs() {   # <resultfile>
+    local rf=$1 list="$TEMP_DIR/recheck.txt" out="$TEMP_DIR/recheck.out" n
+    (( RECHECK_DELAY > 0 )) || return 0
+    awk -F'\t' '$2=="down" && $3=="no-arp-reply"{print $1}' "$rf" > "$list"
+    [[ -s $list ]] || return 0
+    n=$(wc -l < "$list" | tr -d ' ')
+    echo -e "${CYAN}Second-chance check of $n host(s) judged down (waiting ${RECHECK_DELAY}s, then ARP + ping + TCP again)...${NC}"
+    sleep "$RECHECK_DELAY"
+    export METHOD=arp TIMEOUT=$TIMEOUT_SECS PING_TIMEOUT_FLAG ARPING_IFACE_FLAG ARPING_FLAVOR ARPING_USABLE ARP_TRIES INTERFACE TCP_PORTS CANARY_RST
+    xargs -P "${THREADS:-20}" -n 1 bash -c 'check_host "$1" "$METHOD" "$TIMEOUT"' _ < "$list" > "$out"
+    awk -F'\t' -v OFS='\t' 'FNR==NR{r[$1]=$0; next} ($1 in r){print r[$1]; next} {print}' "$out" "$rf" > "$rf.new" && mv "$rf.new" "$rf"
 }
 
 # ---------------------------------------------------------------------------
@@ -822,6 +1008,8 @@ perform_reachability_test() {
         scan_engine_bash "$method" "$TEMP_DIR/ips.txt" "$results" "$threads"
     fi
 
+    recheck_downs "$results"
+
     local up_ips=() down_ips=() filt_ips=()
     mapfile -t up_ips   < <(awk -F'\t' '$2=="up"{print $1}'       "$results" | sortip)
     mapfile -t down_ips < <(awk -F'\t' '$2=="down"{print $1}'     "$results" | sortip)
@@ -934,6 +1122,7 @@ Scan:
   -t, --threads <n>           Parallel workers, bash engine (default: 10).
   -w, --timeout <sec>         Per-probe timeout, bash engine (default: 2).
   -i, --interface <iface>     Interface for arp / nmap raw probes.
+      --arp-tries <n>         ARP requests per host before escalating to ping (default: 4).
 
 Output / UX:
   -o, --output <dir>          Output directory (default: scans/).
@@ -946,6 +1135,9 @@ Output / UX:
       --update                Update to the latest release (installed copy only).
       --check-update          Report whether a newer release exists.
       --no-update-check       Skip the daily update prompt (or set AR_NO_UPDATE_CHECK=1).
+      --check                 Only verify this host can run the chosen method, then exit.
+      --strict                Treat pre-flight warnings (degraded modes) as errors.
+      --recheck-delay <sec>   Pause before re-verifying hosts judged down by silence (default 5; 0 disables).
   -V, --version               Print version.
   -h, --help                  This message.
 
@@ -971,7 +1163,12 @@ Verdict (each host is graded, with the reason as evidence):
             firewall REJECT also produces). Could be a live host dropping your
             probes — re-check with 'nmap -Pn' before trusting it.
 
-Exit status: 0 scan completed, 1 error/usage, 130 interrupted.
+Pre-flight: before probing, the chosen method is checked against this host
+(tools, root/raw sockets, interface, on-subnet targets). Capable -> runs.
+Degraded (e.g. arping missing -> ping fallback) -> WARN and continue, or cancel
+with --strict. Incapable (results would be meaningless) -> cancelled, exit 2.
+
+Exit status: 0 scan completed, 1 error/usage, 2 pre-flight cancelled, 130 interrupted.
 
 Examples:
   $me -c 192.168.1.0/24 -m arp -i eth0 -s
@@ -1023,6 +1220,11 @@ main() {
                     || { echo "Error: timeout must be an integer 1-60 seconds." >&2; exit 1; }
                 TIMEOUT_SECS=$(( 10#$TIMEOUT_SECS ))
                 shift 2 ;;
+            --arp-tries)
+                require_arg "$1" "${2:-}"; ARP_TRIES=$2
+                [[ $ARP_TRIES =~ ^[0-9]+$ ]] && (( 10#$ARP_TRIES >= 1 && 10#$ARP_TRIES <= 20 )) \
+                    || { echo "Error: --arp-tries must be 1-20." >&2; exit 1; }
+                ARP_TRIES=$(( 10#$ARP_TRIES )); shift 2 ;;
             -s|--split-files) split_files="true"; shift ;;
             -j|--json)        json_out="true"; shift ;;
             --resolve)        RESOLVE="true"; shift ;;
@@ -1030,6 +1232,13 @@ main() {
             -y|--yes)         ASSUME_YES="true"; shift ;;
             --no-color)       OPT_NO_COLOR="true"; shift ;;
             --no-update-check) OPT_NO_UPDATE_CHECK="true"; shift ;;
+            --strict)         STRICT="true"; shift ;;
+            --recheck-delay)
+                require_arg "$1" "${2:-}"; RECHECK_DELAY=$2
+                [[ $RECHECK_DELAY =~ ^[0-9]+$ ]] && (( 10#$RECHECK_DELAY <= 120 )) \
+                    || { echo "Error: --recheck-delay must be 0-120 seconds (0 disables)." >&2; exit 1; }
+                RECHECK_DELAY=$(( 10#$RECHECK_DELAY )); shift 2 ;;
+            --check)          CHECK_ONLY="true"; shift ;;
             --update)         setup_colors; self_update; exit $? ;;
             --check-update)
                 latest=$(fetch_latest) || { echo "Can't reach GitHub." >&2; exit 1; }
@@ -1043,9 +1252,19 @@ main() {
     done
 
     setup_colors
-    [[ -n $input_type && -n $input_value ]] || { echo -e "${RED}Error: missing input (-f/-l/-c/-r).${NC}" >&2; display_help 1; }
+    [[ -n $input_type && -n $input_value || $CHECK_ONLY == "true" ]] || { echo -e "${RED}Error: missing input (-f/-l/-c/-r).${NC}" >&2; display_help 1; }
+    if [[ $CHECK_ONLY == "true" ]]; then
+        # Capability report only — no probes are sent. Targets are optional.
+        THREADS=$threads; detect_ping; detect_arping
+        if [[ -n $input_type && -n $input_value ]]; then collect_targets "$input_type" "$input_value"; fi
+        resolve_engine "$scan_method"
+        preflight "$scan_method"
+        echo -e "${GREEN}Capability check passed for '$scan_method'.${NC}"
+        exit 0
+    fi
 
     maybe_prompt_update
+    THREADS=$threads
     detect_ping
     detect_arping
     perform_reachability_test "$input_value" "$input_type" "$verbose" "$threads" "$split_files" "$output_dir" "$scan_method"

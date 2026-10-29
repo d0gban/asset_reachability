@@ -52,6 +52,8 @@ asset-reachability -c 10.0.0.0/24 -m ack                  # nmap engine auto-sel
 | `-e ENGINE` | `auto` (default), `bash`, `nmap` |
 | `-t N` / `-w SEC` | parallel workers (default 10) / per-probe timeout (default 2) |
 | `-i IFACE` | interface for arp / nmap raw probes |
+| `--check` `--strict` | capability report only · treat pre-flight warnings as errors |
+| `--arp-tries N` `--recheck-delay S` | ARP requests per host (default 4) · pause before re-verifying silent "down" hosts (default 5, 0 = off) |
 | `-o DIR` | output directory (default `scans/`) |
 | `-s` `-j` | split up/filtered/down files · JSON output |
 | `--resolve` `-v` `-y` `--no-color` | reverse DNS · list every host · skip the large-scan prompt · no ANSI |
@@ -79,7 +81,7 @@ Each result line carries its reason and a confidence hint, e.g. `10.0.0.5  [arp-
 
 ## Output
 
-A text report, plus optional `-s` (three plain IP lists) and `-j` (JSON with per-host `reason`/`confidence`) in `scans/`. Colours turn off when piped, with `NO_COLOR`, or `--no-color`. Exit status: `0` completed, `1` error, `130` interrupted.
+A text report, plus optional `-s` (three plain IP lists) and `-j` (JSON with per-host `reason`/`confidence`) in `scans/`. Colours turn off when piped, with `NO_COLOR`, or `--no-color`. Exit status: `0` completed, `1` error/usage, `2` pre-flight cancelled, `130` interrupted.
 
 ## Methods and dependencies
 
@@ -95,6 +97,25 @@ A text report, plus optional `-s` (three plain IP lists) and `-j` (JSON with per
 Raw-packet methods (`arp`, `syn`, `ack`, `icmp-*`) need root; without it nmap degrades to TCP-connect probes and the reported reasons show what actually answered.
 
 macOS: the script uses `ping -t` there (BSD `-W` is milliseconds) and `gtimeout` from Homebrew coreutils.
+
+## Pre-flight capability check
+
+Before sending a single probe, the tool verifies the chosen method can produce a **valid** answer on this host, so a probe that can't run never masquerades as "host is down":
+
+| Outcome | Behaviour | Examples |
+|---|---|---|
+| ✓ capable | scan runs | root + working `arping` + interface up + on-subnet targets |
+| ! degraded | WARN, names the fallback, continues (`--strict` cancels) | not root → `arp` falls back to ping; ARP aimed at a routed subnet; `iproute2` missing (false-positive guards off) |
+| ✗ incapable | **cancelled, exit 2**, with a fix hint | interface doesn't exist; no UDP tooling and no nmap; nmap raw method (`arp`/`ack`/`icmp-ts`/`icmp-mask`/`udp`) without root; no `arping` *and* no `ping` |
+
+```sh
+asset-reachability --check -m arp -i eth1 -c 192.168.10.0/24   # report only, sends nothing
+sudo asset-reachability -m arp -i eth1 -c 192.168.10.0/24 --strict
+```
+
+## Lossy ARP (Wi-Fi / power-save hosts)
+
+Some devices answer only a fraction of ARP requests and even ICMP for seconds at a time. To avoid reporting live hosts as `down`, the `arp` method retries (`--arp-tries`, default 4), then escalates to 3 pings, the kernel's own ARP result and a TCP connect. A host is only `down` if all of that fails, **and** a second round after `--recheck-delay` seconds (default 5, `0` disables) also finds nothing. A host that stays silent but can't be proven absent is reported `filtered`.
 
 ## False-positive guards
 

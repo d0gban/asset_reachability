@@ -30,6 +30,7 @@ EOF
 cat > "$STUBS/nmap" <<'EOF'
 #!/usr/bin/env bash
 # minimal nmap: up hosts 10.0.0.1 (echo-reply) and 10.0.0.3 (arp-response)
+[[ ${@: -1} == 127.0.0.1 ]] && { echo "Nmap scan report for 127.0.0.1"; echo "Host is up, received localhost-response (0.00010s latency)."; exit 0; }
 [[ ${STUB_NMAP_FAIL:-0} == 1 ]] && { echo "Failed to resolve interface bogus0" >&2; exit 1; }
 list="" og=""
 while [[ $# -gt 0 ]]; do
@@ -48,6 +49,13 @@ echo "# Nmap done at now" >> "$og"
 exit 0
 EOF
 chmod +x "$STUBS/ping" "$STUBS/nmap"
+cat > "$STUBS/id" <<'EOS'
+#!/usr/bin/env bash
+[[ ${STUB_NONROOT:-0} == 1 ]] && exec /usr/bin/id "$@"
+[[ $1 == -u ]] && { echo 0; exit 0; }
+exec /usr/bin/id "$@"
+EOS
+chmod +x "$STUBS/id"
 
 run() { PATH="$STUBS:$PATH" NO_COLOR=1 AR_NO_UPDATE_CHECK=1 bash "$SCRIPT" "$@" 2>&1; }
 
@@ -89,10 +97,34 @@ PING_RES=echo-reply;   eq "ping up"            "$(check_host 1.1.1.1 ping 1)" $'
 PING_RES=host-unreach; eq "ping host-unreach"  "$(check_host 1.1.1.1 ping 1)" $'1.1.1.1\tdown\thost-unreach'
 PING_RES=no-response;  eq "ping silence"       "$(check_host 1.1.1.1 ping 1)" $'1.1.1.1\tfiltered\tno-response'
 
-ARP_REASON=no-arp-reply; ON_LINK=0; eq "arp silence on-subnet = down"        "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tdown\tno-arp-reply'
-ARP_REASON=no-arp-reply; ON_LINK=1; eq "arp silence routed = filtered"       "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tfiltered\tno-arp-reply-unverified'
-ARP_REASON=no-arp-reply; ON_LINK=2; eq "arp silence unknown = filtered"      "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tfiltered\tno-arp-reply-unverified'
-ARP_REASON=arp-reply;               eq "arp reply = up"                      "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tup\tarp-reply'
+TCP_REASON=no-response; TCP_PORT=""
+l2_unanswered() { [[ ${L2_UNANS:-0} == 1 ]]; }
+l2_fresh()      { [[ ${L2_FRESH:-0} == 1 ]]; }
+PING_RES=no-response
+ARP_REASON=no-arp-reply; L2_UNANS=1; L2_FRESH=0; eq "arp silent + ping silent + kernel ARP failed = down"  "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tdown\tno-arp-reply'
+ARP_REASON=no-arp-reply; L2_UNANS=0; L2_FRESH=0; eq "arp silent, kernel ARP not failed = filtered"        "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tfiltered\tno-arp-reply-unverified'
+ARP_REASON=no-arp-reply; L2_UNANS=0; L2_FRESH=1; eq "arp silent but kernel resolved MAC = up (lossy ARP)" "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tup\tarp-reply(kernel)'
+PING_RES=echo-reply
+ARP_REASON=no-arp-reply; L2_UNANS=1; L2_FRESH=0; eq "arp lost but host answers ping = up (not down)"      "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tup\techo-reply(arp-missed)'
+PING_RES=host-unreach
+ARP_REASON=no-arp-reply; L2_UNANS=0; L2_FRESH=0; eq "arp silent + ICMP host-unreach = down"               "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tdown\thost-unreach'
+PING_RES=no-response; L2_UNANS=0; L2_FRESH=0
+PING_RES=no-response; TCP_REASON=syn-ack; TCP_PORT=22; L2_UNANS=1; L2_FRESH=0
+ARP_REASON=no-arp-reply; eq "arp+ping lost but TCP answers = up (lossy host rescued)" "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tup\tsyn-ack:22'
+TCP_REASON=no-response; TCP_PORT=""; L2_UNANS=0
+# second-chance pass: a down that rests on silence is re-verified; a rescued host flips to up
+REAL_CHECK_HOST=$(declare -f check_host)
+check_host() { printf '%s\tup\techo-reply(arp-missed)\n' "$1"; }; export -f check_host
+TEMP_DIR=$(mktemp -d); RECHECK_DELAY=1; THREADS=2; TIMEOUT_SECS=1
+printf '10.0.0.5\tdown\tno-arp-reply\n10.0.0.6\tdown\thost-unreach\n10.0.0.7\tup\techo-reply\n10.0.0.8\tfiltered\tno-response\n' > "$TEMP_DIR/r.tsv"
+recheck_downs "$TEMP_DIR/r.tsv" >/dev/null
+eq "recheck: silent-down host re-verified & rescued"   "$(grep '^10.0.0.5' "$TEMP_DIR/r.tsv")" $'10.0.0.5\tup\techo-reply(arp-missed)'
+eq "recheck: ICMP host-unreach down is NOT re-probed"  "$(grep '^10.0.0.6' "$TEMP_DIR/r.tsv")" $'10.0.0.6\tdown\thost-unreach'
+eq "recheck: other rows untouched"                     "$(grep -c -E '^10.0.0.(7|8)' "$TEMP_DIR/r.tsv")" "2"
+RECHECK_DELAY=0; printf '10.0.0.5\tdown\tno-arp-reply\n' > "$TEMP_DIR/r.tsv"; recheck_downs "$TEMP_DIR/r.tsv"
+eq "recheck: --recheck-delay 0 disables it"            "$(cat "$TEMP_DIR/r.tsv")" $'10.0.0.5\tdown\tno-arp-reply'
+rm -rf "$TEMP_DIR"; eval "$REAL_CHECK_HOST"; export -f check_host
+ARP_REASON=arp-reply; ON_LINK=0;               eq "arp reply = up"                      "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tup\tarp-reply'
 ARP_REASON=arping-absent; PING_RES=echo-reply; eq "arp falls back to ping"   "$(check_host 1.1.1.1 arp 1)" $'1.1.1.1\tup\techo-reply(arp-fallback)'
 
 TCP_REASON=syn-ack;  TCP_PORT=22;  eq "tcp open = up"                        "$(check_host 1.1.1.1 tcp 1)" $'1.1.1.1\tup\tsyn-ack:22'
@@ -179,6 +211,52 @@ udp_svc() { [[ $1 == dns || $1 == snmp ]]; }
 probe_udp 1.1.1.1 1; rc=$?; eq "poisoned dns skipped, healthy snmp still counts" "$rc:$REASON" "0:snmp-response"
 UDP_POISONED="dns snmp"; probe_udp 1.1.1.1 1; rc=$?; eq "all services poisoned -> never up" "$rc:$REASON" "1:no-response"
 source "$SCRIPT"; unset -f ip
+
+echo "== pre-flight capability checks =="
+OUT="$WORK/out"
+# run preflight in a subshell with simulated host capabilities; prints "rc=N" last
+pf() {   # <engine> <method> [setup-code]
+    local out rc
+    out=$( ( source "$SCRIPT"; OPT_NO_COLOR=true; IS_TTY=false; setup_colors
+             EFFECTIVE_ENGINE=$1; TARGETS=(); INTERFACE=""
+             is_root() { return 0; }; arping_selftest() { return 0; }
+             ping() { return 0; }; timeout() { shift; "$@"; }; dig() { :; }
+             eval "${3:-:}"
+             preflight "$2" ) 2>&1 ); rc=$?
+    printf '%s\nrc=%s' "$out" "$rc"
+}
+r=$(pf bash arp 'arping() { :; }; ip() { :; }');                         has "arp, all capable: runs"               "$r" "arping (" ;  has "arp capable: rc 0" "$r" "rc=0"
+r=$(pf bash arp 'have() { [[ $1 != arping ]] && command -v "$1" >/dev/null 2>&1 || [[ $1 == ping ]]; }');
+has "arp without arping: WARN + ping fallback" "$r" "FALL BACK to ICMP ping"; has "arp without arping: still runs" "$r" "rc=0"
+r=$(pf bash arp 'arping() { :; }; is_root() { return 1; }; can_raw() { return 1; }; ip() { :; }')
+has "arp as non-root: WARN fallback"   "$r" "not root"; has "arp as non-root: still runs" "$r" "rc=0"
+r=$(pf bash arp 'arping() { :; }; is_root() { return 1; }; can_raw() { return 1; }; STRICT=true; ip() { :; }')
+has "--strict turns the warning into a cancel" "$r" "rc=2"; has "--strict message" "$r" "--strict"
+r=$(pf bash arp 'have() { return 1; }; have() { [[ $1 == awk || $1 == sort || $1 == comm || $1 == xargs || $1 == mktemp || $1 == date || $1 == id ]]; }')
+has "arp with no arping AND no ping: cancelled" "$r" "nothing can probe"; has "…rc 2" "$r" "rc=2"
+r=$(pf bash udp 'have() { [[ $1 == awk || $1 == sort || $1 == comm || $1 == xargs || $1 == mktemp || $1 == date || $1 == id || $1 == ip ]]; }')
+has "udp with no tooling: cancelled" "$r" "no UDP tooling"; has "…rc 2" "$r" "rc=2"
+r=$(pf bash tcp 'have() { [[ $1 == awk || $1 == sort || $1 == comm || $1 == xargs || $1 == mktemp || $1 == date || $1 == id || $1 == ip ]]; }')
+has "tcp with no timeout/nc: cancelled" "$r" "needs 'timeout'"; has "…rc 2" "$r" "rc=2"
+r=$(pf bash arp 'arping() { :; }; ip() { [[ $1 == -4 ]] && return 0; return 1; }')
+has "missing interface: cancelled" "$r" "rc=0"   # no -i given -> nothing to verify
+r=$(pf bash arp 'arping() { :; }; INTERFACE=bogus9; ip() { [[ "$*" == "link show dev bogus9" ]] && return 1; return 0; }')
+has "unknown interface: cancelled" "$r" "does not exist"; has "…rc 2" "$r" "rc=2"
+hasnt "unknown interface: no misleading arping complaint" "$r" "self-test"
+r=$(pf nmap ack 'nmap() { echo "Host is up"; }; is_root() { return 1; }; can_raw() { return 1; }; ip() { :; }')
+has "nmap ack as non-root: cancelled (would be substituted)" "$r" "needs raw sockets"; has "…rc 2" "$r" "rc=2"
+r=$(pf nmap syn 'nmap() { echo "Host is up"; }; is_root() { return 1; }; can_raw() { return 1; }; ip() { :; }')
+has "nmap syn as non-root: WARN only" "$r" "TCP-connect"; has "…rc 0" "$r" "rc=0"
+r=$(pf nmap ping 'nmap() { echo "no"; }; ip() { :; }')
+has "nmap broken self-test: cancelled" "$r" "failed a self-test"
+r=$(pf bash ping 'have() { [[ $1 != ip ]] && command -v "$1" >/dev/null 2>&1; }')
+has "missing iproute2: WARN that L2 guards are off" "$r" "L2 false-positive guards"
+r=$(pf bash all 'arping() { :; }; ip() { :; }'); has "all: each layer reported" "$r" "UDP probing available"
+# end to end: --check prints the report and sends nothing; a failed check stops before scanning
+res=$(run --check -m ping); has "--check: report only" "$res" "Capability check passed"; hasnt "--check: no scan ran" "$res" "Result:"
+res=$(STUB_NONROOT=1 run -l 10.0.0.1 -m ack -o "$OUT"); has "e2e: nmap ack non-root cancelled" "$res" "Cancelled"; hasnt "e2e: nothing was scanned" "$res" "Result:"
+STUB_NONROOT=1 run -l 10.0.0.1 -m ack >/dev/null; eq "e2e: cancelled exit code is 2" "$?" "2"
+res=$(run -l 10.0.0.1,10.0.0.2 -m ping -e bash -o "$OUT" --strict); has "e2e: strict + only-iproute2 warning still passes when ip present or cancels cleanly" "$res" "Pre-flight"
 
 echo "== versioning / update =="
 version_gt 5.2.0 5.1.9  && ok "5.2.0 > 5.1.9"   || bad "5.2.0 > 5.1.9"
