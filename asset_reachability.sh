@@ -16,7 +16,7 @@
 
 set -u
 
-VERSION="5.2.0"
+VERSION="5.3.0"
 UPDATE_REPO="d0gban/asset_reachability"
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
@@ -284,6 +284,14 @@ on_link() {   # 0 = target is directly attached (no gateway), 1 = routed, 2 = un
     return 0
 }
 
+# True when the kernel ARPed this directly-attached target and got no answer
+# (INCOMPLETE/FAILED). Absent entries do NOT count: ARP may never have been
+# attempted (e.g. a local OUTPUT rule dropped the probe).
+l2_unanswered() {
+    have ip || return 1
+    on_link "$1" || return 1
+    ip -4 neigh show "$1" 2>/dev/null | grep -qE 'INCOMPLETE|FAILED'
+}
 probe_ping() {      # REASON: echo-reply | host-unreach | no-response
     local ip=$1 to=$2 out rc
     if [[ -n $PING_TIMEOUT_FLAG ]]; then
@@ -316,16 +324,21 @@ tcp_connect() {
     fi
     return 1
 }
-# All ports probed concurrently (worst case ≈ one timeout, not nine).
-# REASON: syn-ack | reset | no-route | no-response
+# Probe every port in TCP_PORTS concurrently (worst case ≈ one timeout, not
+# nine). Leaves one rc file per port in <dir>.
+tcp_ports_run() {   # <ip> <timeout> <dir>
+    local ip=$1 to=$2 dir=$3 port
+    for port in $TCP_PORTS; do
+        ( tcp_connect "$ip" "$port" "$to"; echo $? > "$dir/$port" ) &
+    done
+    wait
+}
+# REASON: syn-ack | reset | reset-unverified | no-route | no-response
 probe_tcp() {
     local ip=$1 to=$2 port tmp rc open="" rst="" route=0
     REPLY_PORT=""; REASON="no-response"
     tmp=$(mktemp -d 2>/dev/null) || return 1
-    for port in $TCP_PORTS; do
-        ( tcp_connect "$ip" "$port" "$to"; echo $? > "$tmp/$port" ) &
-    done
-    wait
+    tcp_ports_run "$ip" "$to" "$tmp"
     for port in $TCP_PORTS; do
         rc=$(<"$tmp/$port")
         case $rc in
@@ -336,36 +349,63 @@ probe_tcp() {
     done
     rm -rf "$tmp"
     if   [[ -n $open ]]; then REPLY_PORT=$open; REASON="syn-ack"; return 0
-    elif [[ -n $rst  ]]; then REPLY_PORT=$rst;  REASON="reset";   return 0   # a stack answered with RST
+    elif [[ -n $rst  ]]; then
+        # The canary found something RST-ing addresses that cannot exist (a REJECT
+        # rule / middlebox). For targets not directly attached, an RST is then no
+        # proof the target itself answered.
+        if [[ ${CANARY_RST:-0} == 1 ]] && ! on_link "$ip"; then REASON="reset-unverified"; return 1; fi
+        REPLY_PORT=$rst; REASON="reset"; return 0                            # a stack answered with RST
     elif (( route )); then REASON="no-route"                                 # host down OR firewall REJECT
     fi
     return 1
 }
+
+# L2 corroboration. A reply from a directly-attached host is only genuine if we
+# hold that host's MAC: no ARP entry (INCOMPLETE/FAILED/absent) means the "reply"
+# was produced locally (NAT REDIRECT, transparent proxy, VPN, ...). A MAC equal to
+# the gateway's means the gateway is proxy-answering for it.
+#   rc 0 = corroborated   1 = no L2 entry   3 = MAC shared with gateway
+#   rc 2 = can't judge (routed target, or no iproute2) -> caller keeps the verdict
+l2_verify() {
+    local ip=$1 mac gwip gwmac
+    have ip || return 2
+    on_link "$ip" || return 2
+    mac=$(ip -4 neigh show "$ip" 2>/dev/null | grep -oE 'lladdr [0-9a-fA-F:]+' | head -n 1)
+    [[ -n $mac ]] || return 1
+    gwip=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
+    if [[ -n $gwip && $gwip != "$ip" ]]; then
+        gwmac=$(ip -4 neigh show "$gwip" 2>/dev/null | grep -oE 'lladdr [0-9a-fA-F:]+' | head -n 1)
+        [[ -n $gwmac && ${mac,,} == "${gwmac,,}" ]] && return 3
+    fi
+    return 0
+}
+# One UDP application probe. rc 0 only on a REAL application-layer reply.
+udp_svc() {   # <dns|snmp|nbt> <ip> <timeout>
+    local svc=$1 ip=$2 to=$3 out
+    case $svc in
+        # dig exits 0 whenever a DNS message came back (even REFUSED), 9 on timeout.
+        dns)  have dig && dig +time="$to" +tries=1 +noall +comments "@$ip" -p 53 . NS >/dev/null 2>&1 ;;
+        # SNMP: any reply — even an auth/community error — proves liveness; only a
+        # timeout means silence.
+        snmp) have snmpget || return 1
+              out=$(run_to $(( to+2 )) snmpget -v2c -c public -t "$to" -r 0 "$ip" 1.3.6.1.2.1.1.1.0 2>&1)
+              [[ -n $out && $out != *[Tt]imeout* && $out != *"No Response"* && $out != *"command not found"* ]] ;;
+        nbt)  have nmblookup && run_to $(( to+2 )) nmblookup -A "$ip" 2>/dev/null | grep -q '<' ;;
+        *)    return 1 ;;
+    esac
+}
+udp_port_of() { case $1 in dns) echo 53;; snmp) echo 161;; nbt) echo 137;; esac; }
+# 'nc -u -z' is deliberately NOT used — it reports success on silence and on
+# router-sourced host-unreachable (false positives). Silence => return 1.
 probe_udp() {       # REASON: dns-response | snmp-response | nbt-response | no-response
-    # 'nc -u -z' is deliberately NOT used — it reports success on silence and on
-    # router-sourced host-unreachable (false positives). We require a real
-    # application-layer reply. Silence => return 1 (never 'up').
-    local ip=$1 to=$2 out
+    local ip=$1 to=$2 svc
     REPLY_PORT=""; REASON="no-response"
-    # dig exits 0 whenever a DNS message came back (even REFUSED), 9 on timeout.
-    if have dig; then
-        if dig +time="$to" +tries=1 +noall +comments "@$ip" -p 53 . NS >/dev/null 2>&1; then
-            REPLY_PORT=53; REASON="dns-response"; return 0
+    for svc in dns snmp nbt; do
+        [[ " ${UDP_POISONED:-} " == *" $svc "* ]] && continue    # intercepted per the canary
+        if udp_svc "$svc" "$ip" "$to"; then
+            REPLY_PORT=$(udp_port_of "$svc"); REASON="${svc}-response"; return 0
         fi
-    fi
-    # SNMP: any reply — even an auth/community error — proves liveness; only a
-    # timeout means silence.
-    if have snmpget; then
-        out=$(run_to $(( to+2 )) snmpget -v2c -c public -t "$to" -r 0 "$ip" 1.3.6.1.2.1.1.1.0 2>&1)
-        if [[ -n $out && $out != *[Tt]imeout* && $out != *"No Response"* && $out != *"command not found"* ]]; then
-            REPLY_PORT=161; REASON="snmp-response"; return 0
-        fi
-    fi
-    if have nmblookup; then
-        if run_to $(( to+2 )) nmblookup -A "$ip" 2>/dev/null | grep -q '<'; then
-            REPLY_PORT=137; REASON="nbt-response"; return 0
-        fi
-    fi
+    done
     return 1
 }
 
@@ -413,9 +453,22 @@ check_host() {
             else verdict="filtered"; reason="${weak:-no-response}"; fi ;;
         *) die "unknown method '$method'" ;;
     esac
+    # Silence/ambiguous errors on a directly-attached target whose ARP went
+    # unanswered is a reliable DOWN; deterministic (no race with ping's timeout).
+    if [[ $verdict == filtered && ( $reason == no-response || $reason == no-route ) ]] && l2_unanswered "$ip"; then
+        verdict="down"; reason="no-arp-reply"
+    fi
+    # Never trust an "up" the network layer can't back (arping replies are already L2).
+    if [[ $verdict == up && $reason != arp-reply* ]]; then
+        l2_verify "$ip"; rc=$?
+        case $rc in
+            1) verdict="filtered"; reason="unverified-no-l2:${reason}" ;;
+            3) verdict="filtered"; reason="shared-mac-with-gateway:${reason}" ;;
+        esac
+    fi
     printf '%s\t%s\t%s\n' "$ip" "$verdict" "$reason"
 }
-export -f have run_to on_link probe_ping probe_arp tcp_connect probe_tcp probe_udp check_host die
+export -f have run_to on_link l2_verify l2_unanswered probe_ping probe_arp tcp_connect tcp_ports_run probe_tcp udp_svc udp_port_of probe_udp check_host die
 
 # ---------------------------------------------------------------------------
 # Progress bar with rate + ETA (TTY only)
@@ -452,6 +505,68 @@ resolve_name() {
 }
 
 # ---------------------------------------------------------------------------
+# Canary: 192.0.2.1 is RFC 5737 TEST-NET-1 — it can never be a real host. Any
+# port that "answers" there is being answered by something local or upstream
+# (NAT REDIRECT, transparent proxy, VPN, REJECT-everything firewall), so that
+# port can't prove anything about a target. Poisoned ports are dropped from
+# TCP_PORTS; RSTs from the canary disable RST-as-proof for routed targets.
+# ---------------------------------------------------------------------------
+CANARY_IP="192.0.2.1"
+CANARY_RST=0
+tcp_canary() {
+    local tmp port rc keep="" poisoned=""
+    have timeout || have nc || return 0
+    tmp=$(mktemp -d 2>/dev/null) || return 0
+    tcp_ports_run "$CANARY_IP" "$TIMEOUT_SECS" "$tmp"
+    for port in $TCP_PORTS; do
+        rc=$(<"$tmp/$port")
+        case $rc in
+            0)  poisoned="$poisoned $port" ;;
+            10) CANARY_RST=1; keep="$keep $port" ;;
+            *)  keep="$keep $port" ;;
+        esac
+    done
+    rm -rf "$tmp"
+    if [[ -n $poisoned ]]; then
+        echo -e "${YELLOW}Warning: port(s)${poisoned} answer on the canary address ${CANARY_IP} — something local/upstream is intercepting them. Excluded from TCP probing.${NC}" >&2
+        TCP_PORTS=${keep# }
+    fi
+    if (( CANARY_RST )); then
+        echo -e "${YELLOW}Note: the canary address returns TCP resets — a RST is not accepted as proof of life for routed targets.${NC}" >&2
+    fi
+    [[ -n $TCP_PORTS ]] || die "every TCP probe port is intercepted; use ping/arp or --engine nmap."
+    export CANARY_RST TCP_PORTS
+}
+
+# UDP canary (bash engine): a service that "replies" from the canary address is
+# being answered locally/upstream, so it's switched off for this scan.
+UDP_POISONED=""
+udp_canary() {
+    local svc found=""
+    for svc in dns snmp nbt; do
+        if udp_svc "$svc" "$CANARY_IP" "$TIMEOUT_SECS"; then found="$found $svc"; fi
+    done
+    if [[ -n $found ]]; then
+        UDP_POISONED=${found# }
+        echo -e "${YELLOW}Warning: UDP service(s)${found} \"reply\" on the canary address ${CANARY_IP} — intercepted locally/upstream. Excluded from UDP probing.${NC}" >&2
+    fi
+    export UDP_POISONED
+}
+# nmap engine: probe the canary with the exact same discovery flags. If it comes
+# up, any routed "up" carrying that same reason is indistinguishable from the
+# interception and is demoted (on-subnet hosts are still judged by their MAC).
+CANARY_REASON=""
+nmap_canary() {   # <probe flags>
+    local out
+    # shellcheck disable=SC2086
+    out=$(nmap -sn -n --reason $1 "$CANARY_IP" 2>/dev/null) || return 0
+    if grep -q 'Host is up' <<<"$out"; then
+        CANARY_REASON=$(sed -n 's/.*received \([a-z-]*\).*/\1/p' <<<"$out" | head -n 1)
+        echo -e "${YELLOW}Warning: the canary address ${CANARY_IP} came up (reason: ${CANARY_REASON:-?}) — routed hosts with that same reason will be reported as filtered.${NC}" >&2
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # nmap engine — runs once over the whole target list. Writes the same
 # "ip<TAB>verdict<TAB>reason" rows as the bash engine to <resultfile>.
 # ---------------------------------------------------------------------------
@@ -469,6 +584,7 @@ scan_engine_nmap() {
         all)        probe="-PR -PE -PP -PM -PS22,80,443,3389,445 -PA80,443 -PU53,161,137" ;;
         *)          die "no nmap mapping for method '$method'" ;;
     esac
+    [[ $method == arp ]] || nmap_canary "$probe"
     local ia=(); [[ -n $INTERFACE ]] && ia=(-e "$INTERFACE")
     echo -e "${CYAN}Running nmap host discovery ($method)...${NC}"
     # -sn: discovery only, -n: no DNS, --reason: record WHY each host is up.
@@ -501,6 +617,23 @@ scan_engine_nmap() {
     else
         awk -v OFS='\t' '{print $1,"filtered","no-response"}' "$TEMP_DIR/notup.txt" >> "$resultfile"
     fi
+    # Demote "up" rows the L2 table can't back (local interception, proxy-ARP).
+    # arp-response is already L2 evidence.
+    local tmpres="$TEMP_DIR/results.l2" v r vrc
+    while IFS=$'\t' read -r ip v r; do
+        if [[ $v == up && $r != arp-response* ]]; then
+            l2_verify "$ip"; vrc=$?
+            case $vrc in
+                1) v="filtered"; r="unverified-no-l2:$r" ;;
+                3) v="filtered"; r="shared-mac-with-gateway:$r" ;;
+            esac
+        fi
+        if [[ $v == filtered && $r == no-response ]] && l2_unanswered "$ip"; then v="down"; r="no-arp-reply"; fi
+        if [[ $v == up && -n $CANARY_REASON && $r == "$CANARY_REASON" ]] && ! on_link "$ip"; then
+            v="filtered"; r="canary-matched:$r"
+        fi
+        printf '%s\t%s\t%s\n' "$ip" "$v" "$r"
+    done < "$resultfile" > "$tmpres" && mv "$tmpres" "$resultfile"
 }
 
 # ---------------------------------------------------------------------------
@@ -508,7 +641,7 @@ scan_engine_nmap() {
 # ---------------------------------------------------------------------------
 scan_engine_bash() {
     local method=$1 ipfile=$2 resultfile=$3 threads=$4 d a
-    export METHOD=$method TIMEOUT=$TIMEOUT_SECS PING_TIMEOUT_FLAG ARPING_IFACE_FLAG INTERFACE TCP_PORTS
+    export METHOD=$method TIMEOUT=$TIMEOUT_SECS PING_TIMEOUT_FLAG ARPING_IFACE_FLAG INTERFACE TCP_PORTS CANARY_RST UDP_POISONED
     : > "$resultfile"
     xargs -P "$threads" -n 1 bash -c 'check_host "$1" "$METHOD" "$TIMEOUT"' _ \
         < "$ipfile" > "$resultfile" &
@@ -550,6 +683,10 @@ confidence() {
         host-unreach)                                echo "ICMP host-unreachable from the path";;
         no-arp-reply)                                echo "no L2 reply on a directly-attached subnet — reliable down";;
         no-arp-reply-unverified)                     echo "no ARP reply, but target not proven on-subnet — verify";;
+        unverified-no-l2*)                           echo "reply but NO ARP entry for an on-subnet host — answered locally (NAT/proxy), not by the host";;
+        shared-mac-with-gateway*)                    echo "reply carries the gateway's MAC — proxy-ARP/gateway answered, not the host";;
+        canary-matched*)                             echo "routed reply identical to what the canary address returns — interception, not the host";;
+        reset-unverified)                            echo "RST, but the canary address also RSTs — firewall/middlebox, not proof of life";;
         no-route)                                    echo "ICMP unreachable on connect — host down OR firewall REJECT; verify";;
         probe-error)                                 echo "probe failed to run — rerun";;
         no-response|"")                              echo "silent — could be filtered, verify (nmap -Pn)";;
@@ -674,6 +811,8 @@ perform_reachability_test() {
     printf '%s\n' "${TARGETS[@]}" > "$TEMP_DIR/ips.txt"
     START_EPOCH=$(date +%s)
     local results="$TEMP_DIR/results.tsv"
+    case $method in tcp|syn|all) tcp_canary ;; esac
+    if [[ $eng == "bash" ]]; then case $method in udp|all) udp_canary ;; esac; fi
 
     # -- run -----------------------------------------------------------------
     if [[ $eng == "nmap" ]]; then

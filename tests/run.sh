@@ -112,6 +112,74 @@ has "reset hint"              "$(confidence reset:80)"      "RST"
 has "no-route is ambiguous"   "$(confidence no-route)"      "firewall REJECT"
 eq  "json escaping" "$(json_str 'a"b\c')" 'a\"b\\c'
 
+echo "== false-positive guards (L2 corroboration + canary) =="
+# restore real functions that the verdict-logic section stubbed out
+source "$SCRIPT"
+ip() {   # stub for iproute2: ip -4 route get X | neigh show X | route show default
+    case "$*" in
+        "-4 route get 10.0.0.9")  echo "10.0.0.9 dev eth0 src 10.0.0.2" ;;
+        "-4 route get 10.0.0.77") echo "10.0.0.77 dev eth0 src 10.0.0.2" ;;
+        "-4 route get 10.0.0.6")  echo "10.0.0.6 dev eth0 src 10.0.0.2" ;;
+        "-4 route get 10.0.0.5")  echo "10.0.0.5 dev eth0 src 10.0.0.2" ;;
+        "-4 route get 8.8.4.4")   echo "8.8.4.4 via 10.0.0.1 dev eth0 src 10.0.0.2" ;;
+        "-4 route show default")  echo "default via 10.0.0.1 dev eth0" ;;
+        "-4 neigh show 10.0.0.1") echo "10.0.0.1 dev eth0 lladdr aa:aa:aa:aa:aa:01 REACHABLE" ;;
+        "-4 neigh show 10.0.0.9") echo "10.0.0.9 dev eth0 lladdr bb:bb:bb:bb:bb:09 STALE" ;;
+        "-4 neigh show 10.0.0.77") echo "10.0.0.77 dev eth0  INCOMPLETE" ;;
+        "-4 neigh show 10.0.0.6") echo "10.0.0.6 dev eth0 lladdr AA:AA:AA:AA:AA:01 REACHABLE" ;;
+        "-4 neigh show 10.0.0.5") ;;
+    esac
+}
+l2_verify 10.0.0.9;  eq "l2_verify: resolved MAC -> corroborated"        "$?" 0
+l2_verify 10.0.0.77; eq "l2_verify: INCOMPLETE -> not corroborated"      "$?" 1
+l2_verify 10.0.0.5;  eq "l2_verify: no entry -> not corroborated"        "$?" 1
+l2_verify 10.0.0.6;  eq "l2_verify: gateway's MAC -> shared (proxy-ARP)" "$?" 3
+l2_verify 8.8.4.4;   eq "l2_verify: routed target -> can't judge"        "$?" 2
+l2_unanswered 10.0.0.77 && ok "l2_unanswered: INCOMPLETE on-link" || bad "l2_unanswered INCOMPLETE"
+l2_unanswered 10.0.0.5  && bad "l2_unanswered: absent entry must NOT count" || ok "l2_unanswered: absent entry must NOT count"
+l2_unanswered 10.0.0.9  && bad "l2_unanswered: resolved host is not unanswered" || ok "l2_unanswered: resolved host is not unanswered"
+
+# check_host end-to-end with the real l2 guards
+probe_ping() { REASON=$PING_RES; [[ $REASON == echo-reply ]]; }
+probe_tcp()  { REASON=$TCP_REASON; REPLY_PORT=$TCP_PORT; [[ $REASON == syn-ack || $REASON == reset ]]; }
+probe_udp()  { REASON=$UDP_REASON; REPLY_PORT=53; [[ $REASON == dns-response ]]; }
+PING_RES=no-response; TCP_REASON=syn-ack; TCP_PORT=53
+eq "intercepted TCP reply on dead on-link host -> NOT up"      "$(check_host 10.0.0.77 tcp 1)" $'10.0.0.77\tfiltered\tunverified-no-l2:syn-ack:53'
+eq "genuine TCP reply on resolved host -> up"                  "$(check_host 10.0.0.9 tcp 1)"  $'10.0.0.9\tup\tsyn-ack:53'
+eq "proxy-ARP'd reply -> NOT up"                               "$(check_host 10.0.0.6 tcp 1)"  $'10.0.0.6\tfiltered\tshared-mac-with-gateway:syn-ack:53'
+eq "routed target keeps its verdict (canary guards it)"        "$(check_host 8.8.4.4 tcp 1)"   $'8.8.4.4\tup\tsyn-ack:53'
+UDP_REASON=dns-response
+eq "intercepted UDP reply on dead on-link host -> NOT up"      "$(check_host 10.0.0.77 udp 1)" $'10.0.0.77\tfiltered\tunverified-no-l2:dns-response:53'
+PING_RES=no-response
+eq "silent + ARP unanswered = deterministic DOWN (ping)"       "$(check_host 10.0.0.77 ping 1)" $'10.0.0.77\tdown\tno-arp-reply'
+eq "silent but answered ARP = stays FILTERED (live, quiet)"    "$(check_host 10.0.0.9 ping 1)"  $'10.0.0.9\tfiltered\tno-response'
+eq "silent + no ARP attempt recorded = stays FILTERED"         "$(check_host 10.0.0.5 ping 1)"  $'10.0.0.5\tfiltered\tno-response'
+TCP_REASON=no-route; TCP_PORT=""
+eq "tcp no-route + ARP unanswered = DOWN"                      "$(check_host 10.0.0.77 tcp 1)"  $'10.0.0.77\tdown\tno-arp-reply'
+eq "tcp no-route + host answers ARP = FILTERED (REJECT rule)"  "$(check_host 10.0.0.9 tcp 1)"   $'10.0.0.9\tfiltered\tno-route'
+
+# canary: ports/services that answer on 192.0.2.1 are excluded
+tcp_connect() { case $2 in 53) return 0;; 22) return 10;; *) return 1;; esac; }
+TCP_PORTS="22 53 80"; CANARY_RST=0; tcp_canary 2>/dev/null
+eq "tcp_canary drops intercepted port"        "$TCP_PORTS" "22 80"
+eq "tcp_canary notes canary RSTs"             "$CANARY_RST" "1"
+on_link() { return 1; }   # routed target
+probe_tcp() { local ip=$1; REPLY_PORT=""; REASON="no-response"; return 1; }
+unset -f probe_tcp; source "$SCRIPT"
+tcp_ports_run() { for p in $TCP_PORTS; do echo 10 > "$3/$p"; done; }
+CANARY_RST=1; probe_tcp 8.8.4.4 1; rc=$?
+eq "RST on a routed target is not proof when canary RSTs" "$rc:$REASON" "1:reset-unverified"
+CANARY_RST=0; probe_tcp 8.8.4.4 1; rc=$?
+eq "RST on a routed target counts when canary is silent"  "$rc:$REASON" "0:reset"
+source "$SCRIPT"
+udp_svc() { [[ $1 == dns ]]; }
+UDP_POISONED=""; udp_canary 2>/dev/null
+eq "udp_canary excludes intercepted dns"      "$UDP_POISONED" "dns"
+udp_svc() { [[ $1 == dns || $1 == snmp ]]; }
+probe_udp 1.1.1.1 1; rc=$?; eq "poisoned dns skipped, healthy snmp still counts" "$rc:$REASON" "0:snmp-response"
+UDP_POISONED="dns snmp"; probe_udp 1.1.1.1 1; rc=$?; eq "all services poisoned -> never up" "$rc:$REASON" "1:no-response"
+source "$SCRIPT"; unset -f ip
+
 echo "== versioning / update =="
 version_gt 5.2.0 5.1.9  && ok "5.2.0 > 5.1.9"   || bad "5.2.0 > 5.1.9"
 version_gt 5.10.0 5.9.0 && ok "5.10.0 > 5.9.0 (numeric, not lexical)" || bad "numeric compare"

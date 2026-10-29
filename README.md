@@ -96,6 +96,19 @@ Raw-packet methods (`arp`, `syn`, `ack`, `icmp-*`) need root; without it nmap de
 
 macOS: the script uses `ping -t` there (BSD `-W` is milliseconds) and `gtimeout` from Homebrew coreutils.
 
+## False-positive guards
+
+Reachability scanners are easily fooled by anything on the path that answers on a host's behalf. These guards (v5.3.0) were developed against a real appliance that NAT-redirected every outgoing TCP/UDP port 53 to a local resolver — which made a naive scan report all 254 addresses "up":
+
+| Guard | What it catches |
+|---|---|
+| **L2 corroboration** | A reply from a directly-attached host is only accepted if its MAC is in the neighbour table. No ARP entry ⇒ answered locally (NAT/proxy/VPN) ⇒ `filtered` (`unverified-no-l2`). |
+| **Proxy-ARP check** | A reply whose MAC equals the gateway's ⇒ `filtered` (`shared-mac-with-gateway`). |
+| **Canary address** | Before TCP/UDP probing, `192.0.2.1` (RFC 5737 TEST-NET, never a real host) is probed. Any port/service that "answers" there is intercepted and excluded from the scan; canary RSTs stop RST counting as proof for routed targets. |
+| **Deterministic DOWN** | A directly-attached target whose ARP went unanswered is `down` (`no-arp-reply`) whatever the probe type — no race with ping's timeout. A host that answers ARP but ignores probes stays `filtered`. |
+
+Routed targets (behind a gateway) have no MAC to check, so for them the canary is the guard. If you scan from a host with `iproute2` missing, the L2 guards are skipped and the tool says so.
+
 ## Updates
 
 The installed command checks GitHub for a newer `VERSION` at most once every 24 hours, only in an interactive terminal, and asks:
