@@ -92,6 +92,7 @@ probe_tcp()  { REASON=$TCP_REASON; REPLY_PORT=$TCP_PORT; [[ $REASON == syn-ack |
 probe_udp()  { REASON=no-response; return 1; }
 probe_arp()  { REASON=$ARP_REASON; case $ARP_REASON in arp-reply) return 0;; arping-absent) return 2;; *) return 1;; esac; }
 on_link()    { return "${ON_LINK:-0}"; }
+l2_verify()  { return 2; }   # verdict logic only: keep the real L2 check out (it consults the host ARP table)
 
 PING_RES=echo-reply;   eq "ping up"            "$(check_host 1.1.1.1 ping 1)" $'1.1.1.1\tup\techo-reply'
 PING_RES=host-unreach; eq "ping host-unreach"  "$(check_host 1.1.1.1 ping 1)" $'1.1.1.1\tdown\thost-unreach'
